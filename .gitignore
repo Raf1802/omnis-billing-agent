@@ -1,0 +1,12 @@
+# secrets
+.env
+
+# dependencies
+node_modules/
+
+# logs
+logs/
+*.log
+
+# debug screenshots (may contain patient/claim data)
+*.png
