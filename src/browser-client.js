@@ -3,9 +3,18 @@ const { chromium } = require('playwright-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 chromium.use(StealthPlugin());
 
+// One consistent identity used for EVERY page and popup. The bug before was
+// that the main page got a User-Agent header but popups (window.open) did not,
+// so popups looked like headless bots and Office Ally CAPTCHA-challenged them.
+// Setting userAgent at the CONTEXT level makes all pages + popups inherit it.
+const USER_AGENT =
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 ' +
+  '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+
 class BrowserClient {
   constructor() {
     this.browser = null;
+    this.context = null;
     this.page = null;
   }
 
@@ -21,20 +30,39 @@ class BrowserClient {
         '--disable-accelerated-2d-canvas',
         '--no-first-run',
         '--no-zygote',
-        '--disable-gpu'
+        '--disable-gpu',
+        '--disable-blink-features=AutomationControlled' // hide the automation flag
       ]
     });
-    this.page = await this.browser.newPage();
-    await this.page.setExtraHTTPHeaders({
-      'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+
+    // Create ONE context with a real, consistent fingerprint. Every page and
+    // every popup opened from this context inherits userAgent, viewport,
+    // locale, and timezone — so popups no longer look like headless bots.
+    this.context = await this.browser.newContext({
+      userAgent: USER_AGENT,
+      viewport: { width: 1440, height: 900 },
+      locale: 'en-US',
+      timezoneId: 'America/New_York',
+      deviceScaleFactor: 1,
+      isMobile: false,
+      hasTouch: false,
     });
-    console.log("✅ Chromium launched");
+
+    // Extra belt-and-suspenders: strip the webdriver flag on every page/popup
+    // in this context, including ones opened later via window.open.
+    await this.context.addInitScript(() => {
+      Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+    });
+
+    this.page = await this.context.newPage();
+    console.log("✅ Chromium launched (context-level fingerprint applied)");
   }
 
   async close() {
     if (this.browser) {
       await this.browser.close();
       this.browser = null;
+      this.context = null;
       this.page = null;
     }
   }
@@ -207,7 +235,6 @@ class BrowserClient {
     }
     if (loginBtn) await loginBtn.click();
 
-    // Wait for navigation to fully settle
     try {
       await this.page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 60000 });
     } catch(e) {}
@@ -276,38 +303,30 @@ class BrowserClient {
           }
           await sleep(delay);
           break;
-
         case "type":
           if (action.selector) await this.page.click(action.selector);
           await this.page.keyboard.type(action.text, { delay: 60 });
           await sleep(500);
           break;
-
         case "select":
           await this.page.selectOption(action.selector, action.value);
           await sleep(delay);
           break;
-
         case "navigate":
           await this.page.goto(action.url, { waitUntil: 'domcontentloaded', timeout: 60000 });
           break;
-
         case "wait":
           await sleep(action.ms || 2000);
           break;
-
         case "scroll":
           await this.page.evaluate(y => window.scrollBy(0, y), action.y || 300);
           await sleep(500);
           break;
-
         default:
           return { data: { success: false, error: `Unknown action: ${action.type}` } };
       }
-
       const screenshot = await this.page.screenshot({ encoding: 'base64' });
       return { data: { success: true, screenshot, url: this.page.url() } };
-
     } catch (error) {
       console.error(`Action failed: ${error.message}`);
       const screenshot = await this.page.screenshot({ encoding: 'base64' }).catch(() => null);
