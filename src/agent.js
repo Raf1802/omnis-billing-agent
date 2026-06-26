@@ -581,7 +581,7 @@ class BillingAgent {
       const searchBtn = await this.browser.page.$('#ctl00_phFolderContent_ucSearch_btnSearch');
       if (searchBtn) await searchBtn.click();
       // Wait for results: a link with the patient's name (next step) to appear.
-      await this.browser.page.waitForSelector(`a:has-text("${claimData.patient_last_name}")`, { timeout: 8000 }).catch(() => {});
+      await this.browser.page.waitForSelector(`a:has-text("${claimData.patient_last_name}")`, { state: 'visible', timeout: 10000 }).catch(() => {});
 
       // ── Step 4: Click patient name in results ─────────────────────
       logger.log(`🖱️  Clicking on: ${claimData.patient_last_name}`);
@@ -593,21 +593,29 @@ class BillingAgent {
         logger.log("⚠️  Patient link not found");
       }
       // Wait for the Template tab (next step) to be present.
-      await this.browser.page.waitForSelector('a:has-text("Template")', { timeout: 8000 }).catch(() => {});
+      await this.browser.page.waitForSelector('a:has-text("Template")', { state: 'visible', timeout: 10000 }).catch(() => {});
 
       // ── Step 5: Click Template tab ────────────────────────────────
       logger.log("📋 Clicking Template tab...");
       const templateTab = await this.browser.page.$('a:has-text("Template")');
       if (templateTab) { await templateTab.click(); logger.log("✅ Clicked Template"); }
-      // Wait for Create New Visit (next step).
-      await this.browser.page.waitForSelector('a:has-text("Create New Visit")', { timeout: 8000 }).catch(() => {});
+      // Create New Visit must be VISIBLE (not just present) before we click it.
+      // Waiting only for presence proceeded too early and the click failed with
+      // "element is not visible". Wait for visible, then a brief settle.
+      await this.browser.page.waitForSelector('a:has-text("Create New Visit")', { state: 'visible', timeout: 12000 }).catch(() => {});
+      await this.browser.page.waitForTimeout(800);
 
       // ── Step 6: Click Create New Visit ────────────────────────────
       logger.log("🆕 Clicking Create New Visit...");
-      const createVisitBtn = await this.browser.page.$('a:has-text("Create New Visit")');
-      if (createVisitBtn) { await createVisitBtn.click(); logger.log("✅ Clicked Create New Visit"); }
-      // Wait for the visit-date Month field (next step) to exist.
-      await this.browser.page.waitForSelector('#ctl00_phFolderContent_DateVisited_Month', { timeout: 8000 }).catch(() => {});
+      // locator.click auto-waits for visibility/stability; give it room since
+      // this is the step that was timing out.
+      await this.browser.page.locator('a:has-text("Create New Visit")').first()
+        .click({ timeout: 15000 })
+        .then(() => logger.log("✅ Clicked Create New Visit"))
+        .catch(e => { throw new Error(`Create New Visit click failed: ${e.message.slice(0, 80)}`); });
+      // The visit-date Month field must be VISIBLE before Step 7 fills it.
+      await this.browser.page.waitForSelector('#ctl00_phFolderContent_DateVisited_Month', { state: 'visible', timeout: 12000 }).catch(() => {});
+      await this.browser.page.waitForTimeout(500);
 
       // ── Step 7: Fill Visit Date ───────────────────────────────────
       const visitDate = this.convertDate(claimData.dos_from);
@@ -752,7 +760,8 @@ class BillingAgent {
       }
 
       // Wait for the Billing Info tab (next step) instead of a flat 3s.
-      await this.browser.page.waitForSelector('a:has-text("Billing Info"), [id*="BillingInfo"]', { timeout: 8000 }).catch(() => {});
+      await this.browser.page.waitForSelector('a:has-text("Billing Info"), [id*="BillingInfo"]', { state: 'visible', timeout: 10000 }).catch(() => {});
+      await this.browser.page.waitForTimeout(500);
       await this.shot(this.browser.page, "after-provider.png");
 
       // ── Step 10: Click Billing Info tab ──────────────────────────
@@ -760,7 +769,8 @@ class BillingAgent {
       const billingInfoTab = await this.browser.page.$('a:has-text("Billing Info"), [id*="BillingInfo"]');
       if (billingInfoTab) { await billingInfoTab.click(); logger.log("✅ Clicked Billing Info"); }
       // Wait for the first ICD code field (next step) to exist.
-      await this.browser.page.waitForSelector('#ctl00_phFolderContent_ucDiagnosisCodes_dc_10_1', { timeout: 8000 }).catch(() => {});
+      await this.browser.page.waitForSelector('#ctl00_phFolderContent_ucDiagnosisCodes_dc_10_1', { state: 'visible', timeout: 10000 }).catch(() => {});
+      await this.browser.page.waitForTimeout(500);
 
       // ── Step 11: Fill ICD-10 codes ───────────────────────────────
       logger.log("🏥 Filling ICD-10 codes...");
@@ -904,7 +914,8 @@ class BillingAgent {
         logger.log("⚠️  Billing Options tab not found");
       }
       // Wait for the Facility lookup button (next step) to exist.
-      await page.waitForSelector('#ctl00_phFolderContent_Button35', { timeout: 8000 }).catch(() => {});
+      await page.waitForSelector('#ctl00_phFolderContent_Button35', { state: 'visible', timeout: 10000 }).catch(() => {});
+      await page.waitForTimeout(500);
       await this.shot(page, "billing-options.png");
 
       // ── Step 15: Facility lookup (HCFA box 32) ───────────────────
