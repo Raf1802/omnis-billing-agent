@@ -238,9 +238,10 @@ class BrowserClient {
     try {
       await this.page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 60000 });
     } catch(e) {}
-    await sleep(8000);
+    // Navigation is already awaited above; a short settle is enough for the
+    // post-login page / CAPTCHA-check to render (was a flat 8s).
     await this.page.waitForLoadState('domcontentloaded').catch(() => {});
-    await sleep(2000);
+    await sleep(2500);
 
     let postLoginBody = await this.page.evaluate(() => document.body.innerText);
     if (postLoginBody.includes('testing whether you are a human')) {

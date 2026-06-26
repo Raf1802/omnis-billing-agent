@@ -12,6 +12,11 @@ class BillingAgent {
   }
 
   saveDebugScreenshot(filename, base64Data) {
+    // Screenshots are debug-only. In production (Railway) they cost ~150-300ms
+    // each AND write PHI (patient names/DOB/diagnoses) to disk, so they're
+    // skipped unless DEBUG_SCREENSHOTS=true. Set that env var to re-enable for
+    // debugging. This single gate disables all ~31 capture sites at once.
+    if (process.env.DEBUG_SCREENSHOTS !== 'true') return;
     try {
       if (Buffer.isBuffer(base64Data)) {
         fs.writeFileSync(filename, base64Data);
@@ -20,6 +25,14 @@ class BillingAgent {
       }
       console.log(`📸 Screenshot saved: ${filename}`);
     } catch(e) {}
+  }
+
+  // Capture + save in one call, but ONLY do the (expensive) capture when debug
+  // screenshots are enabled. Use this instead of saveDebugScreenshot(name, await
+  // target.screenshot()) so the screenshot() call itself is skipped in prod.
+  async shot(target, filename) {
+    if (process.env.DEBUG_SCREENSHOTS !== 'true') return;
+    try { this.saveDebugScreenshot(filename, await target.screenshot()); } catch(e) {}
   }
 
   convertDate(dateStr) {
@@ -553,7 +566,8 @@ class BillingAgent {
       if (!clicked) {
         try { await this.browser.page.click('text=Manage Patients'); } catch(e) {}
       }
-      await this.browser.page.waitForTimeout(3000);
+      // Wait for the search field (next step) instead of a flat 3s.
+      await this.browser.page.waitForSelector('#ctl00_phFolderContent_ucSearch_txtSearch', { timeout: 8000 }).catch(() => {});
 
       // ── Step 2: Search by last name ───────────────────────────────
       logger.log(`🔍 Searching for: ${claimData.patient_last_name}`);
@@ -566,7 +580,8 @@ class BillingAgent {
       // ── Step 3: Click Search ──────────────────────────────────────
       const searchBtn = await this.browser.page.$('#ctl00_phFolderContent_ucSearch_btnSearch');
       if (searchBtn) await searchBtn.click();
-      await this.browser.page.waitForTimeout(3000);
+      // Wait for results: a link with the patient's name (next step) to appear.
+      await this.browser.page.waitForSelector(`a:has-text("${claimData.patient_last_name}")`, { timeout: 8000 }).catch(() => {});
 
       // ── Step 4: Click patient name in results ─────────────────────
       logger.log(`🖱️  Clicking on: ${claimData.patient_last_name}`);
@@ -577,19 +592,22 @@ class BillingAgent {
       } else {
         logger.log("⚠️  Patient link not found");
       }
-      await this.browser.page.waitForTimeout(3000);
+      // Wait for the Template tab (next step) to be present.
+      await this.browser.page.waitForSelector('a:has-text("Template")', { timeout: 8000 }).catch(() => {});
 
       // ── Step 5: Click Template tab ────────────────────────────────
       logger.log("📋 Clicking Template tab...");
       const templateTab = await this.browser.page.$('a:has-text("Template")');
       if (templateTab) { await templateTab.click(); logger.log("✅ Clicked Template"); }
-      await this.browser.page.waitForTimeout(3000);
+      // Wait for Create New Visit (next step).
+      await this.browser.page.waitForSelector('a:has-text("Create New Visit")', { timeout: 8000 }).catch(() => {});
 
       // ── Step 6: Click Create New Visit ────────────────────────────
       logger.log("🆕 Clicking Create New Visit...");
       const createVisitBtn = await this.browser.page.$('a:has-text("Create New Visit")');
       if (createVisitBtn) { await createVisitBtn.click(); logger.log("✅ Clicked Create New Visit"); }
-      await this.browser.page.waitForTimeout(3000);
+      // Wait for the visit-date Month field (next step) to exist.
+      await this.browser.page.waitForSelector('#ctl00_phFolderContent_DateVisited_Month', { timeout: 8000 }).catch(() => {});
 
       // ── Step 7: Fill Visit Date ───────────────────────────────────
       const visitDate = this.convertDate(claimData.dos_from);
@@ -733,15 +751,16 @@ class BillingAgent {
         }
       }
 
-      await this.browser.page.waitForTimeout(3000);
-      const afterProviderBuffer = await this.browser.page.screenshot();
-      this.saveDebugScreenshot("after-provider.png", afterProviderBuffer);
+      // Wait for the Billing Info tab (next step) instead of a flat 3s.
+      await this.browser.page.waitForSelector('a:has-text("Billing Info"), [id*="BillingInfo"]', { timeout: 8000 }).catch(() => {});
+      await this.shot(this.browser.page, "after-provider.png");
 
       // ── Step 10: Click Billing Info tab ──────────────────────────
       logger.log("💰 Clicking Billing Info tab...");
       const billingInfoTab = await this.browser.page.$('a:has-text("Billing Info"), [id*="BillingInfo"]');
       if (billingInfoTab) { await billingInfoTab.click(); logger.log("✅ Clicked Billing Info"); }
-      await this.browser.page.waitForTimeout(3000);
+      // Wait for the first ICD code field (next step) to exist.
+      await this.browser.page.waitForSelector('#ctl00_phFolderContent_ucDiagnosisCodes_dc_10_1', { timeout: 8000 }).catch(() => {});
 
       // ── Step 11: Fill ICD-10 codes ───────────────────────────────
       logger.log("🏥 Filling ICD-10 codes...");
@@ -749,10 +768,7 @@ class BillingAgent {
       const page = this.browser.page;
 
       await page.evaluate(() => window.scrollTo(0, 0));
-      await page.waitForTimeout(1000);
-
-      const beforeIcdBuf = await page.screenshot();
-      this.saveDebugScreenshot("before-icd-fill.png", beforeIcdBuf);
+      await this.shot(page, "before-icd-fill.png");
 
       const icdCodes = claimData.icd10_codes
         .split(",")
@@ -869,13 +885,13 @@ class BillingAgent {
       // One line for a normal claim, two for a same patient+DOS pair.
       const lines = this.buildLines(claimData);
       logger.log(`🧾 Filling ${lines.length} billing line(s)`);
-      this.saveDebugScreenshot("before-cpt.png", await page.screenshot());
+      await this.shot(page, "before-cpt.png");
 
       for (let li = 0; li < lines.length; li++) {
         await this.fillLine(li, lines[li], icdCodes, logger);
       }
 
-      this.saveDebugScreenshot("after-lines.png", await page.screenshot());
+      await this.shot(page, "after-lines.png");
       logger.log("📸 Saved after-lines.png");
 
       // ── Step 14: Billing Options tab ─────────────────────────────
@@ -887,8 +903,9 @@ class BillingAgent {
       } else {
         logger.log("⚠️  Billing Options tab not found");
       }
-      await page.waitForTimeout(3000);
-      this.saveDebugScreenshot("billing-options.png", await page.screenshot());
+      // Wait for the Facility lookup button (next step) to exist.
+      await page.waitForSelector('#ctl00_phFolderContent_Button35', { timeout: 8000 }).catch(() => {});
+      await this.shot(page, "billing-options.png");
 
       // ── Step 15: Facility lookup (HCFA box 32) ───────────────────
       // Search by the claim's facility name and select the EXACT match.
@@ -897,7 +914,7 @@ class BillingAgent {
         search: claimData.facility_name,
         matchName: claimData.facility_name,
       });
-      this.saveDebugScreenshot("after-facility.png", await page.screenshot());
+      await this.shot(page, "after-facility.png");
 
       // ── Step 16: Billing Provider lookup (HCFA box 33) ───────────
       // Match strategy depends on the biller:
@@ -917,7 +934,7 @@ class BillingAgent {
       }
       logger.log(`🏥 Opening Billing Provider lookup...`);
       await this.selectFromPopup('ctl00_phFolderContent_Button57', 'Billing Provider', logger, billOpts);
-      this.saveDebugScreenshot("after-billing-provider.png", await page.screenshot());
+      await this.shot(page, "after-billing-provider.png");
 
       // Verify the key Billing Options fields by their real ids (found via the
       // earlier field dump). Billing NPI is the one that gets a claim rejected
@@ -948,7 +965,7 @@ class BillingAgent {
       // Irreversible save. Every prior step verified (throws on failure), so
       // by here the form is confirmed filled.
       logger.log("💾 Clicking Update to create the visit...");
-      this.saveDebugScreenshot("before-update.png", await page.screenshot());
+      await this.shot(page, "before-update.png");
 
       let updateBtn = await page.$('input[type="submit"][value="Update" i], input[type="button"][value="Update" i], button:has-text("Update")');
       if (!updateBtn) {
@@ -962,7 +979,7 @@ class BillingAgent {
       // Let the save round-trip settle, then capture the after-state for review.
       await page.waitForLoadState('domcontentloaded').catch(() => {});
       await page.waitForTimeout(4000);
-      this.saveDebugScreenshot("after-update.png", await page.screenshot());
+      await this.shot(page, "after-update.png");
       logger.log(`📍 Post-Update URL: ${page.url()}`);
       logger.log("📸 Saved after-update.png — review to confirm the visit was created");
 
