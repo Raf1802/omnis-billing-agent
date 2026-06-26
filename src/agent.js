@@ -678,32 +678,36 @@ class BillingAgent {
           return out;
         });
 
-        // Try each token as the Last Name search term until rows come back.
+        // Provider lists are short. Click "Show All" FIRST and match in-memory —
+        // this avoids the slow, wasted token searches (e.g. searching "omnis"
+        // returned 0 rows and burned ~25s waiting before trying "health").
         let rows = [];
-        for (const term of tokens) {
-          const sb = await popup.$('input[type="text"]:visible') || await popup.$('input[type="text"]');
-          if (sb) { await sb.click({ clickCount: 3 }); await sb.fill(''); await sb.type(term, { delay: 80 }); }
-          const searchBtn = await popup.$(searchBtnSel);
-          if (searchBtn) await searchBtn.click();
+        const showAll = await popup.$('input[value="Show All"], button:has-text("Show All")');
+        if (showAll) {
+          await showAll.click();
           await popup.waitForFunction(
             () => Array.from(document.querySelectorAll('a')).some(a => a.textContent.trim() === 'Select'),
             { timeout: 8000 }
           ).catch(() => {});
           rows = await readRows();
-          logger.log(`🔎 Provider search "${term}": ${rows.length} row(s)`);
-          if (rows.length > 0) break;
+          logger.log(`🔎 Provider "Show All": ${rows.length} row(s)`);
         }
 
+        // Fallback: if Show All wasn't available or returned nothing, search by
+        // each token until rows come back (order-independent).
         if (rows.length === 0) {
-          const showAll = await popup.$('input[value="Show All"], button:has-text("Show All")');
-          if (showAll) {
-            await showAll.click();
+          for (const term of tokens) {
+            const sb = await popup.$('input[type="text"]:visible') || await popup.$('input[type="text"]');
+            if (sb) { await sb.click({ clickCount: 3 }); await sb.fill(''); await sb.type(term, { delay: 80 }); }
+            const searchBtn = await popup.$(searchBtnSel);
+            if (searchBtn) await searchBtn.click();
             await popup.waitForFunction(
               () => Array.from(document.querySelectorAll('a')).some(a => a.textContent.trim() === 'Select'),
-              { timeout: 8000 }
+              { timeout: 6000 }
             ).catch(() => {});
             rows = await readRows();
-            logger.log(`🔎 Provider "Show All": ${rows.length} row(s)`);
+            logger.log(`🔎 Provider search "${term}": ${rows.length} row(s)`);
+            if (rows.length > 0) break;
           }
         }
 
