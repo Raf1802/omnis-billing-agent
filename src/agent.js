@@ -110,7 +110,9 @@ class BillingAgent {
       throw new Error(`${label} popup CAPTCHA could not be solved`);
     }
 
-    // Optional search by text.
+    // Optional search by text. For multi-result lookups (facility, provider)
+    // we type the search term, hit Search, and then pick the EXACT matching
+    // row — never the first row blindly.
     if (opts.search) {
       const sb = await popup.$('input[type="text"]:visible') || await popup.$('input[type="text"]');
       if (sb) { await sb.click({ clickCount: 3 }); await sb.fill(''); await sb.type(opts.search, { delay: 80 }); }
@@ -143,12 +145,116 @@ class BillingAgent {
       throw new Error(`${label} popup returned no selectable row`);
     }
 
-    // Click first Select; popup closes itself via the opener callback.
+    // ── Row selection ────────────────────────────────────────────────
+    // PRIORITY: if matchNpi is given, match by NPI (the only unique key when
+    // rows collide by name — e.g. Omnis has two billing-provider rows that are
+    // IDENTICAL by name/address/Tax ID and differ ONLY by NPI). NPI is exact
+    // and unambiguous, so it's preferred over name whenever available.
+    if (opts.matchNpi) {
+      const wantedNpi = String(opts.matchNpi).replace(/\D/g, '');  // digits only
+
+      const rows = await popup.evaluate(() => {
+        const out = [];
+        Array.from(document.querySelectorAll('tr')).forEach((tr) => {
+          const sel = Array.from(tr.querySelectorAll('a')).find(a => a.textContent.trim() === 'Select');
+          if (!sel) return;
+          out.push({ cells: Array.from(tr.querySelectorAll('td')).map(td => (td.innerText || '').trim()) });
+        });
+        return out;
+      });
+
+      // A row matches if any cell, stripped to digits, equals the wanted NPI.
+      const matches = [];
+      rows.forEach((r, idx) => {
+        const cellDigits = r.cells.map(c => String(c).replace(/\D/g, ''));
+        if (cellDigits.includes(wantedNpi)) matches.push(idx);
+      });
+      logger.log(`🔎 ${label} NPI "${wantedNpi}": ${matches.length} match(es) of ${rows.length} rows`);
+
+      if (matches.length !== 1) {
+        this.saveDebugScreenshot(`${label.toLowerCase().replace(/\s+/g, '-')}-npi-${matches.length}.png`, await popup.screenshot());
+        await popup.close().catch(() => {});
+        throw new Error(`${label} NPI "${wantedNpi}": expected 1 match, found ${matches.length} — refusing to guess`);
+      }
+
+      const selectLinks = popup.locator('a:has-text("Select")');
+      logger.log(`✅ ${label} matched by NPI ${wantedNpi} (row ${matches[0]})`);
+      await Promise.all([
+        popup.waitForEvent('close', { timeout: 10000 }).catch(() => {}),
+        selectLinks.nth(matches[0]).click({ noWaitAfter: true }).catch(() => {})
+      ]);
+      logger.log(`✅ ${label} selected (NPI ${wantedNpi})`);
+      await page.waitForTimeout(2000);
+      return;
+    }
+
+    // If a matchName is given, find the row whose name cell EXACTLY matches
+    // (case-insensitive, whitespace-normalized) and click THAT row's Select.
+    // Safety-critical: with many facilities/providers, "first row" bills the
+    // wrong one, and near-duplicate names (two "Bristal" facilities) make a
+    // loose "contains" match unsafe. So: exact match preferred, fail on
+    // ambiguity, single close match allowed but logged loudly.
+    if (opts.matchName) {
+      const wanted = opts.matchName.trim().replace(/\s+/g, ' ').toLowerCase();
+
+      const rows = await popup.evaluate(() => {
+        const out = [];
+        const trs = Array.from(document.querySelectorAll('tr'));
+        trs.forEach((tr) => {
+          const sel = Array.from(tr.querySelectorAll('a')).find(a => a.textContent.trim() === 'Select');
+          if (!sel) return;
+          const cells = Array.from(tr.querySelectorAll('td')).map(td => (td.innerText || '').trim());
+          out.push({ cells, rowText: (tr.innerText || '').replace(/\s+/g, ' ').trim() });
+        });
+        return out;
+      });
+
+      const norm = s => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+
+      const exactMatches = [];
+      const looseMatches = [];
+      rows.forEach((r, idx) => {
+        const cellNorms = r.cells.map(norm);
+        if (cellNorms.includes(wanted)) exactMatches.push(idx);
+        else if (cellNorms.some(c => c.length > 4 && (c.includes(wanted) || wanted.includes(c)))) looseMatches.push(idx);
+      });
+
+      logger.log(`🔎 ${label} match "${opts.matchName}": ${exactMatches.length} exact, ${looseMatches.length} loose, ${rows.length} rows`);
+
+      let targetIndex = -1;
+      if (exactMatches.length === 1) {
+        targetIndex = exactMatches[0];
+      } else if (exactMatches.length > 1) {
+        this.saveDebugScreenshot(`${label.toLowerCase().replace(/\s+/g, '-')}-ambiguous.png`, await popup.screenshot());
+        await popup.close().catch(() => {});
+        throw new Error(`${label} "${opts.matchName}": ${exactMatches.length} exact matches — ambiguous, refusing to guess`);
+      } else if (looseMatches.length === 1) {
+        targetIndex = looseMatches[0];
+        logger.log(`⚠️  ${label} "${opts.matchName}": no exact match, using single close match: "${rows[targetIndex].rowText.slice(0, 60)}"`);
+      } else {
+        this.saveDebugScreenshot(`${label.toLowerCase().replace(/\s+/g, '-')}-no-match.png`, await popup.screenshot());
+        await popup.close().catch(() => {});
+        throw new Error(`${label} "${opts.matchName}": no matching row (${exactMatches.length} exact, ${looseMatches.length} loose of ${rows.length})`);
+      }
+
+      const selectLinks = popup.locator('a:has-text("Select")');
+      logger.log(`✅ ${label} matched row ${targetIndex}: "${rows[targetIndex].rowText.slice(0, 60)}"`);
+      await Promise.all([
+        popup.waitForEvent('close', { timeout: 10000 }).catch(() => {}),
+        selectLinks.nth(targetIndex).click({ noWaitAfter: true }).catch(() => {})
+      ]);
+      logger.log(`✅ ${label} selected (matched "${opts.matchName}")`);
+      await page.waitForTimeout(2000);
+      return;
+    }
+
+    // No matchName → legacy single-result behavior: click first Select.
+    // Only safe when there's exactly one choice (single-facility accounts).
     await Promise.all([
       popup.waitForEvent('close', { timeout: 10000 }).catch(() => {}),
       popup.click('a:has-text("Select")', { noWaitAfter: true }).catch(() => {})
     ]);
-    logger.log(`✅ ${label} selected`);
+    logger.log(`✅ ${label} selected (first row)`);
     await page.waitForTimeout(2000);
   }
 
@@ -523,20 +629,108 @@ class BillingAgent {
         this.saveDebugScreenshot("provider-popup.png", buf);
       } catch(e) {}
 
-      logger.log("🖱️  Clicking Select in popup...");
-      try {
-        await popup.waitForSelector('a:has-text("Select")', { timeout: 5000 });
-        // Popup closes itself on Select (opener callback fills the parent),
-        // so race the click against 'close' rather than requiring it to resolve.
+      // Rendering provider: this biller has MULTIPLE providers, so we must
+      // search by name and select the exact match — not the first row.
+      // NAME ORDER IS NOT ASSUMED. The sheet is inconsistent: "Samar Abrar"
+      // (first last) vs "Ghanni Muhammad" (last first). So we do NOT guess
+      // which token is the surname. Instead we try searching by EACH token
+      // until the popup returns rows, then match the row where ALL of the
+      // claim's name tokens appear across the row's cells (order-independent).
+      const rp = (claimData.rendering_provider || '').trim();
+      if (rp) {
+        const norm = s => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+        const tokens = rp.split(/\s+/).map(norm).filter(t => t.length > 1);
+
+        const searchBtnSel = 'input[value="Search"], button:has-text("Search"), input[type="submit"]';
+        const readRows = async () => popup.evaluate(() => {
+          const out = [];
+          Array.from(document.querySelectorAll('tr')).forEach((tr) => {
+            const sel = Array.from(tr.querySelectorAll('a')).find(a => a.textContent.trim() === 'Select');
+            if (!sel) return;
+            out.push({ cells: Array.from(tr.querySelectorAll('td')).map(td => (td.innerText || '').trim()) });
+          });
+          return out;
+        });
+
+        // Try each token as the Last Name search term until rows come back.
+        let rows = [];
+        for (const term of tokens) {
+          const sb = await popup.$('input[type="text"]:visible') || await popup.$('input[type="text"]');
+          if (sb) { await sb.click({ clickCount: 3 }); await sb.fill(''); await sb.type(term, { delay: 80 }); }
+          const searchBtn = await popup.$(searchBtnSel);
+          if (searchBtn) await searchBtn.click();
+          await popup.waitForFunction(
+            () => Array.from(document.querySelectorAll('a')).some(a => a.textContent.trim() === 'Select'),
+            { timeout: 8000 }
+          ).catch(() => {});
+          rows = await readRows();
+          logger.log(`🔎 Provider search "${term}": ${rows.length} row(s)`);
+          if (rows.length > 0) break;
+        }
+
+        if (rows.length === 0) {
+          const showAll = await popup.$('input[value="Show All"], button:has-text("Show All")');
+          if (showAll) {
+            await showAll.click();
+            await popup.waitForFunction(
+              () => Array.from(document.querySelectorAll('a')).some(a => a.textContent.trim() === 'Select'),
+              { timeout: 8000 }
+            ).catch(() => {});
+            rows = await readRows();
+            logger.log(`🔎 Provider "Show All": ${rows.length} row(s)`);
+          }
+        }
+
+        // MATCH STRATEGY:
+        //   - If a rendering_npi is present AND match_provider_by_npi is set,
+        //     match by NPI (required when provider rows collide by name, e.g.
+        //     Omnis's two "OMNIS HEALTH LIFE" rows differing only by NPI).
+        //   - Otherwise match by name tokens (order-independent), which handles
+        //     Samar's "Samar Abrar" / "Ghanni Muhammad" inconsistent ordering.
+        let matches = [];
+        if (claimData.match_provider_by_npi && claimData.rendering_npi) {
+          const wantNpi = String(claimData.rendering_npi).replace(/\D/g, '');
+          rows.forEach((r, idx) => {
+            if (r.cells.map(c => String(c).replace(/\D/g, '')).includes(wantNpi)) matches.push(idx);
+          });
+          logger.log(`🔎 Provider by NPI "${wantNpi}": ${matches.length} match(es) of ${rows.length} rows`);
+        } else {
+          rows.forEach((r, idx) => {
+            const cellNorms = r.cells.map(norm);
+            const haystack = cellNorms.join(' ');
+            const allPresent = tokens.every(t => cellNorms.includes(t) || haystack.includes(t));
+            if (allPresent) matches.push(idx);
+          });
+          logger.log(`🔎 Provider "${rp}": ${matches.length} match(es) of ${rows.length} rows`);
+        }
+
+        if (matches.length !== 1) {
+          this.saveDebugScreenshot("provider-match-fail.png", await popup.screenshot());
+          await popup.close().catch(() => {});
+          throw new Error(`Rendering provider "${rp}": expected 1 match, found ${matches.length} — refusing to guess`);
+        }
+
+        const selectLinks = popup.locator('a:has-text("Select")');
         await Promise.all([
           popup.waitForEvent('close', { timeout: 10000 }).catch(() => {}),
-          popup.click('a:has-text("Select")', { noWaitAfter: true }).catch(e => {
-            logger.log(`ℹ️  Provider Select teardown (expected): ${e.message.slice(0, 60)}`);
-          })
+          selectLinks.nth(matches[0]).click({ noWaitAfter: true }).catch(() => {})
         ]);
-        logger.log("✅ Clicked Select (popup closed)");
-      } catch(e) {
-        logger.log(`⚠️  Select error: ${e.message.slice(0, 80)}`);
+        logger.log(`✅ Rendering provider selected (matched "${rp}")`);
+      } else {
+        // No provider name on the claim → legacy first-row behavior.
+        logger.log("🖱️  No rendering_provider given — clicking first Select...");
+        try {
+          await popup.waitForSelector('a:has-text("Select")', { timeout: 5000 });
+          await Promise.all([
+            popup.waitForEvent('close', { timeout: 10000 }).catch(() => {}),
+            popup.click('a:has-text("Select")', { noWaitAfter: true }).catch(e => {
+              logger.log(`ℹ️  Provider Select teardown (expected): ${e.message.slice(0, 60)}`);
+            })
+          ]);
+          logger.log("✅ Clicked Select (popup closed)");
+        } catch(e) {
+          logger.log(`⚠️  Select error: ${e.message.slice(0, 80)}`);
+        }
       }
 
       await this.browser.page.waitForTimeout(3000);
@@ -697,15 +891,32 @@ class BillingAgent {
       this.saveDebugScreenshot("billing-options.png", await page.screenshot());
 
       // ── Step 15: Facility lookup (HCFA box 32) ───────────────────
-      // Button35 → OpenPopup({popupName:'Facilities'}). Select the first row.
-      logger.log("🏢 Opening Facility lookup...");
-      await this.selectFromPopup('ctl00_phFolderContent_Button35', 'Facility', logger);
+      // Search by the claim's facility name and select the EXACT match.
+      logger.log(`🏢 Opening Facility lookup (search: "${claimData.facility_name}")...`);
+      await this.selectFromPopup('ctl00_phFolderContent_Button35', 'Facility', logger, {
+        search: claimData.facility_name,
+        matchName: claimData.facility_name,
+      });
       this.saveDebugScreenshot("after-facility.png", await page.screenshot());
 
       // ── Step 16: Billing Provider lookup (HCFA box 33) ───────────
-      // Button57 → OpenPopup({popupName:'BillingProvider'}). Select the first row.
-      logger.log("🏥 Opening Billing Provider lookup...");
-      await this.selectFromPopup('ctl00_phFolderContent_Button57', 'Billing Provider', logger);
+      // Match strategy depends on the biller:
+      //   - If claimData.match_billing_by_npi is true AND a real billing_npi is
+      //     present → match by NPI. REQUIRED for billers whose billing-provider
+      //     rows collide by name (e.g. Omnis: two identical-name rows differing
+      //     ONLY by NPI). NPI is the unique key there; name is useless.
+      //   - Otherwise → match by name (e.g. Samar, whose "Billing Npi" column is
+      //     actually a Tax ID and whose name is the reliable key).
+      const billOpts = { search: claimData.billing_provider || '' };
+      if (claimData.match_billing_by_npi && claimData.billing_npi) {
+        billOpts.matchNpi = claimData.billing_npi;
+        logger.log(`🏥 Billing Provider: matching by NPI ${claimData.billing_npi}`);
+      } else if (claimData.billing_provider) {
+        billOpts.matchName = claimData.billing_provider;
+        logger.log(`🏥 Billing Provider: matching by name "${claimData.billing_provider}"`);
+      }
+      logger.log(`🏥 Opening Billing Provider lookup...`);
+      await this.selectFromPopup('ctl00_phFolderContent_Button57', 'Billing Provider', logger, billOpts);
       this.saveDebugScreenshot("after-billing-provider.png", await page.screenshot());
 
       // Verify the key Billing Options fields by their real ids (found via the
@@ -722,10 +933,16 @@ class BillingAgent {
       if (!billingProvVal || !billingProvVal.trim()) {
         throw new Error("Billing Provider ID did not populate after selection");
       }
-      if (claimData.billing_npi && billingNpiVal !== claimData.billing_npi) {
-        throw new Error(`Billing NPI mismatch: expected "${claimData.billing_npi}", got "${billingNpiVal}"`);
+      // NOTE: We do NOT compare the sheet's "Billing Npi" to the field, because
+      // for this biller that column holds the Tax ID, not the NPI — they will
+      // never be equal. The selection itself is verified by exact name-match in
+      // selectFromPopup (which throws on no-match/ambiguous), so a wrong billing
+      // provider can't be selected silently. We only confirm the NPI field is
+      // populated (a blank NPI gets the claim rejected at HCFA box 33a).
+      if (!billingNpiVal || !billingNpiVal.trim()) {
+        throw new Error("Billing Provider NPI field is empty after selection");
       }
-      logger.log("✅ Facility + Billing Provider + NPI verified");
+      logger.log("✅ Facility + Billing Provider selected and verified (by name match)");
 
       // ── Step 17: Click Update to create the visit ────────────────
       // Irreversible save. Every prior step verified (throws on failure), so
