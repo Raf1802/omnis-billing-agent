@@ -595,27 +595,48 @@ class BillingAgent {
       // Wait for the Template tab (next step) to be present.
       await this.browser.page.waitForSelector('a:has-text("Template")', { state: 'visible', timeout: 10000 }).catch(() => {});
 
-      // ── Step 5: Click Template tab ────────────────────────────────
-      logger.log("📋 Clicking Template tab...");
-      const templateTab = await this.browser.page.$('a:has-text("Template")');
-      if (templateTab) { await templateTab.click(); logger.log("✅ Clicked Template"); }
-      // Create New Visit must be VISIBLE (not just present) before we click it.
-      // Waiting only for presence proceeded too early and the click failed with
-      // "element is not visible". Wait for visible, then a brief settle.
-      await this.browser.page.waitForSelector('a:has-text("Create New Visit")', { state: 'visible', timeout: 12000 }).catch(() => {});
-      await this.browser.page.waitForTimeout(800);
+      // ── Step 5+6: Template tab → Create New Visit ─────────────────
+      // This transition is the fragile one under batch load: pages render
+      // slower when claims run back-to-back, so a single tight wait often
+      // missed and the click timed out. We now (a) let the page settle, then
+      // (b) retry the whole Template→CreateNewVisit sequence a few times,
+      // re-clicking Template each attempt, since re-opening the template view
+      // reliably re-renders the "Create New Visit" link.
+      const page0 = this.browser.page;
+      let visitOpened = false;
+      for (let attempt = 1; attempt <= 3 && !visitOpened; attempt++) {
+        try {
+          logger.log(`📋 Clicking Template tab... (attempt ${attempt})`);
+          const templateTab = await page0.$('a:has-text("Template")');
+          if (templateTab) { await templateTab.click(); logger.log("✅ Clicked Template"); }
 
-      // ── Step 6: Click Create New Visit ────────────────────────────
-      logger.log("🆕 Clicking Create New Visit...");
-      // locator.click auto-waits for visibility/stability; give it room since
-      // this is the step that was timing out.
-      await this.browser.page.locator('a:has-text("Create New Visit")').first()
-        .click({ timeout: 15000 })
-        .then(() => logger.log("✅ Clicked Create New Visit"))
-        .catch(e => { throw new Error(`Create New Visit click failed: ${e.message.slice(0, 80)}`); });
-      // The visit-date Month field must be VISIBLE before Step 7 fills it.
-      await this.browser.page.waitForSelector('#ctl00_phFolderContent_DateVisited_Month', { state: 'visible', timeout: 12000 }).catch(() => {});
-      await this.browser.page.waitForTimeout(500);
+          // Let any navigation/AJAX from the Template click settle before we
+          // look for Create New Visit (avoids "execution context destroyed").
+          await page0.waitForLoadState('networkidle', { timeout: 8000 }).catch(() => {});
+
+          // Wait for Create New Visit to be genuinely VISIBLE.
+          await page0.waitForSelector('a:has-text("Create New Visit")', { state: 'visible', timeout: 12000 });
+          await page0.waitForTimeout(600);
+
+          logger.log("🆕 Clicking Create New Visit...");
+          await page0.locator('a:has-text("Create New Visit")').first().click({ timeout: 12000 });
+          logger.log("✅ Clicked Create New Visit");
+
+          // Confirm we actually advanced: the visit-date Month field appears.
+          await page0.waitForSelector('#ctl00_phFolderContent_DateVisited_Month', { state: 'visible', timeout: 12000 });
+          visitOpened = true;
+        } catch (e) {
+          logger.log(`⚠️  Create New Visit attempt ${attempt} failed: ${e.message.slice(0, 70)}`);
+          if (attempt < 3) {
+            // Settle and retry. Re-clicking Template re-renders the link.
+            await page0.waitForTimeout(2500);
+          }
+        }
+      }
+      if (!visitOpened) {
+        throw new Error("Create New Visit could not be opened after 3 attempts");
+      }
+      await page0.waitForTimeout(400);
 
       // ── Step 7: Fill Visit Date ───────────────────────────────────
       const visitDate = this.convertDate(claimData.dos_from);
