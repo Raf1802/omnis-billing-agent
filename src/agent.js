@@ -582,16 +582,74 @@ class BillingAgent {
       if (searchBtn) await searchBtn.click();
       // Wait for results: a link with the patient's name (next step) to appear.
       await this.browser.page.waitForSelector(`a:has-text("${claimData.patient_last_name}")`, { state: 'visible', timeout: 10000 }).catch(() => {});
+      // Let the results navigation/render fully settle before we read the DOM —
+      // reading mid-navigation throws "execution context was destroyed".
+      await this.browser.page.waitForLoadState('networkidle', { timeout: 6000 }).catch(() => {});
+      await this.browser.page.waitForTimeout(500);
 
-      // ── Step 4: Click patient name in results ─────────────────────
-      logger.log(`🖱️  Clicking on: ${claimData.patient_last_name}`);
-      const patientLink = await this.browser.page.$(`a:has-text("${claimData.patient_last_name}")`);
-      if (patientLink) {
-        await patientLink.click();
-        logger.log("✅ Clicked patient");
-      } else {
-        logger.log("⚠️  Patient link not found");
+      // ── Step 4: Click the CORRECT patient in results ──────────────
+      // Many patients share a last name (Eric Freeman vs ..., two Larrys, two
+      // Johnsons). Clicking the first link matching the last name can open the
+      // WRONG patient and bill someone else — unacceptable. So we read the
+      // results table, find the row whose first AND last name match (and DOB
+      // when available), and click THAT patient's link. Fail safe on ambiguity.
+      logger.log(`🖱️  Selecting patient: ${claimData.patient_first_name} ${claimData.patient_last_name}`);
+      const pnorm = s => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+      const wantFirst = pnorm(claimData.patient_first_name);
+      const wantLast  = pnorm(claimData.patient_last_name);
+      const wantDob   = pnorm(claimData.patient_dob).replace(/\b0/g, ''); // tolerate 7/5 vs 07/05
+
+      // Collect candidate patient links with their row context (the row text
+      // usually contains first name, last name, DOB, member id).
+      const candidates = await this.browser.page.evaluate(({ wantLast }) => {
+        const out = [];
+        // Patient name links live in the results grid; gather links whose row
+        // mentions the last name, with the full row text for verification.
+        const links = Array.from(document.querySelectorAll('a'));
+        links.forEach((a, idx) => {
+          const txt = (a.textContent || '').trim();
+          if (!txt) return;
+          const row = a.closest('tr');
+          const rowText = row ? (row.innerText || '').replace(/\s+/g, ' ').trim() : txt;
+          // Only consider links whose row references the last name (cheap filter).
+          if (rowText.toLowerCase().includes(wantLast)) {
+            out.push({ idx, linkText: txt, rowText });
+          }
+        });
+        return out;
+      }, { wantLast });
+
+      // Score each candidate: must contain BOTH first and last name; DOB is a
+      // strong tiebreaker when present.
+      const scored = candidates.map(c => {
+        const rt = pnorm(c.rowText);
+        const hasLast = rt.includes(wantLast);
+        const hasFirst = rt.includes(wantFirst);
+        const hasDob = wantDob && rt.replace(/\b0/g, '').includes(wantDob);
+        return { ...c, hasLast, hasFirst, hasDob };
+      });
+
+      // Prefer rows matching first+last (+DOB). Exact = first AND last present.
+      let matches = scored.filter(c => c.hasLast && c.hasFirst);
+      // If DOB is available and narrows further, use it to disambiguate.
+      if (wantDob && matches.filter(c => c.hasDob).length === 1) {
+        matches = matches.filter(c => c.hasDob);
       }
+      logger.log(`🔎 Patient match: ${matches.length} candidate(s) for "${claimData.patient_first_name} ${claimData.patient_last_name}" (${candidates.length} share last name)`);
+
+      if (matches.length === 0) {
+        throw new Error(`Patient "${claimData.patient_first_name} ${claimData.patient_last_name}" not found in results (${candidates.length} last-name matches, none with first name)`);
+      }
+      if (matches.length > 1) {
+        const preview = matches.slice(0, 3).map(m => m.rowText.slice(0, 50)).join(' | ');
+        throw new Error(`Patient "${claimData.patient_first_name} ${claimData.patient_last_name}" ambiguous: ${matches.length} matches — refusing to guess [${preview}]`);
+      }
+
+      // Click the verified patient's link by its index among all <a> elements.
+      const targetIdx = matches[0].idx;
+      const allLinks = this.browser.page.locator('a');
+      await allLinks.nth(targetIdx).click();
+      logger.log(`✅ Clicked verified patient: "${matches[0].rowText.slice(0, 50)}"`);
       // Wait for the Template tab (next step) to be present.
       await this.browser.page.waitForSelector('a:has-text("Template")', { state: 'visible', timeout: 10000 }).catch(() => {});
 
@@ -604,9 +662,19 @@ class BillingAgent {
       // reliably re-renders the "Create New Visit" link.
       const page0 = this.browser.page;
       let visitOpened = false;
-      for (let attempt = 1; attempt <= 3 && !visitOpened; attempt++) {
+      const MAX_CNV = 4;
+      for (let attempt = 1; attempt <= MAX_CNV && !visitOpened; attempt++) {
         try {
           logger.log(`📋 Clicking Template tab... (attempt ${attempt})`);
+          // On later attempts, reload the patient page to recover from a bad
+          // state (slow/different patient pages sometimes never render the link).
+          if (attempt >= 3) {
+            logger.log("🔄 Reloading patient page to recover...");
+            await page0.reload({ waitUntil: 'domcontentloaded' }).catch(() => {});
+            await page0.waitForLoadState('networkidle', { timeout: 8000 }).catch(() => {});
+            await page0.waitForSelector('a:has-text("Template")', { state: 'visible', timeout: 10000 }).catch(() => {});
+          }
+
           const templateTab = await page0.$('a:has-text("Template")');
           if (templateTab) { await templateTab.click(); logger.log("✅ Clicked Template"); }
 
@@ -627,14 +695,14 @@ class BillingAgent {
           visitOpened = true;
         } catch (e) {
           logger.log(`⚠️  Create New Visit attempt ${attempt} failed: ${e.message.slice(0, 70)}`);
-          if (attempt < 3) {
-            // Settle and retry. Re-clicking Template re-renders the link.
-            await page0.waitForTimeout(2500);
+          if (attempt < MAX_CNV) {
+            // Escalating settle: later attempts wait longer for slow pages.
+            await page0.waitForTimeout(2000 + attempt * 1500);
           }
         }
       }
       if (!visitOpened) {
-        throw new Error("Create New Visit could not be opened after 3 attempts");
+        throw new Error(`Create New Visit could not be opened after ${MAX_CNV} attempts`);
       }
       await page0.waitForTimeout(400);
 
