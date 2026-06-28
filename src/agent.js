@@ -599,21 +599,22 @@ class BillingAgent {
       const wantLast  = pnorm(claimData.patient_last_name);
       const wantDob   = pnorm(claimData.patient_dob).replace(/\b0/g, ''); // tolerate 7/5 vs 07/05
 
-      // Collect candidate patient links with their row context (the row text
-      // usually contains first name, last name, DOB, member id).
+      // Collect candidate patient links with their row context. NOTE: each
+      // patient row has TWO clickable links (Last Name AND First Name), so the
+      // same patient can appear twice — we dedupe by the row's Patient ID below.
       const candidates = await this.browser.page.evaluate(({ wantLast }) => {
         const out = [];
-        // Patient name links live in the results grid; gather links whose row
-        // mentions the last name, with the full row text for verification.
         const links = Array.from(document.querySelectorAll('a'));
         links.forEach((a, idx) => {
           const txt = (a.textContent || '').trim();
           if (!txt) return;
           const row = a.closest('tr');
           const rowText = row ? (row.innerText || '').replace(/\s+/g, ' ').trim() : txt;
-          // Only consider links whose row references the last name (cheap filter).
           if (rowText.toLowerCase().includes(wantLast)) {
-            out.push({ idx, linkText: txt, rowText });
+            // Patient ID is the leading number in the row (e.g. "157633551 ...").
+            const idMatch = rowText.match(/\b(\d{6,})\b/);
+            const patientId = idMatch ? idMatch[1] : rowText.slice(0, 30);
+            out.push({ idx, linkText: txt, rowText, patientId });
           }
         });
         return out;
@@ -629,20 +630,28 @@ class BillingAgent {
         return { ...c, hasLast, hasFirst, hasDob };
       });
 
-      // Prefer rows matching first+last (+DOB). Exact = first AND last present.
-      let matches = scored.filter(c => c.hasLast && c.hasFirst);
-      // If DOB is available and narrows further, use it to disambiguate.
-      if (wantDob && matches.filter(c => c.hasDob).length === 1) {
-        matches = matches.filter(c => c.hasDob);
+      // Rows matching first+last (+DOB).
+      let matched = scored.filter(c => c.hasLast && c.hasFirst);
+      if (wantDob && matched.filter(c => c.hasDob).length >= 1) {
+        matched = matched.filter(c => c.hasDob);
       }
-      logger.log(`🔎 Patient match: ${matches.length} candidate(s) for "${claimData.patient_first_name} ${claimData.patient_last_name}" (${candidates.length} share last name)`);
+
+      // DEDUPE by patient ID — a single patient's row has two links (last+first
+      // name), which must NOT count as two separate matches.
+      const byPatient = new Map();
+      for (const c of matched) {
+        if (!byPatient.has(c.patientId)) byPatient.set(c.patientId, c);
+      }
+      const matches = Array.from(byPatient.values());
+
+      logger.log(`🔎 Patient match: ${matches.length} patient(s) for "${claimData.patient_first_name} ${claimData.patient_last_name}" (${candidates.length} links share last name)`);
 
       if (matches.length === 0) {
-        throw new Error(`Patient "${claimData.patient_first_name} ${claimData.patient_last_name}" not found in results (${candidates.length} last-name matches, none with first name)`);
+        throw new Error(`Patient "${claimData.patient_first_name} ${claimData.patient_last_name}" not found in results (${candidates.length} last-name link matches, none with first name)`);
       }
       if (matches.length > 1) {
         const preview = matches.slice(0, 3).map(m => m.rowText.slice(0, 50)).join(' | ');
-        throw new Error(`Patient "${claimData.patient_first_name} ${claimData.patient_last_name}" ambiguous: ${matches.length} matches — refusing to guess [${preview}]`);
+        throw new Error(`Patient "${claimData.patient_first_name} ${claimData.patient_last_name}" ambiguous: ${matches.length} distinct patients — refusing to guess [${preview}]`);
       }
 
       // Click the verified patient's link by its index among all <a> elements.
