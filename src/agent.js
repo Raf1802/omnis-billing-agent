@@ -11,6 +11,60 @@ class BillingAgent {
     this.maxCycles = parseInt(process.env.MAX_CYCLES || "20");
   }
 
+  // Warm-session reuse. The billing agent is now long-lived: instead of a fresh
+  // browser + full Office Ally login per claim (~50s since the Auth0 move), we
+  // keep one logged-in session alive and reuse it. Before each claim we
+  // (a) navigate to a known home page — a clean starting state that recovers
+  // from whatever the previous claim left behind, including a failed one — and
+  // (b) confirm we're still authenticated. Only if the session is gone (or no
+  // browser is up yet) do we pay for a full login.
+  //
+  // The health check is URL-only on purpose: the dashboard's "Manage Patients"
+  // link lives inside a frame, so a top-level selector check just times out and
+  // makes every claim log in again.
+  async ensureLoggedIn(logger) {
+    // Cold start: no page yet, but a session cached on disk may still be valid.
+    // Launch and try it before paying ~44s for the Auth0 round trip.
+    if (!this.browser.page && this.browser.hasSavedSession()) {
+      logger.log("🍪 Cached session found — trying it before logging in");
+      await this.browser.launch().catch(() => {});
+    }
+
+    if (this.browser.page) {
+      try {
+        await this.browser.page.goto("https://pm.officeally.com/pm", {
+          waitUntil: "domcontentloaded",
+          timeout: 30000,
+        });
+        await this.browser.page.waitForTimeout(700);
+        const url = this.browser.page.url();
+        if (!/login\.aspx|auth\.officeally|\/login/i.test(url)) {
+          logger.log("♻️  Reusing warm Office Ally session (skipped login)");
+          return;
+        }
+        logger.log("⚠️  Warm session no longer authenticated — logging in again");
+        // The cached cookies are dead; drop them so the next cold start doesn't
+        // repeat this wasted navigation.
+        this.browser.clearSession();
+      } catch (e) {
+        logger.log(`⚠️  Warm session unhealthy (${(e.message || "").slice(0, 50)}) — re-launching`);
+        // Page may be crashed/detached — tear down so login() relaunches cleanly.
+        await this.teardown().catch(() => {});
+      }
+    }
+    await this.login(logger);
+    // login() throws on failure, so reaching here means we're authenticated.
+    // Cache the session for the next cold start.
+    await this.browser.saveSession();
+  }
+
+  // Close the browser but keep this agent object — the next claim's
+  // ensureLoggedIn() will relaunch + log in. Used by the idle timer and on a
+  // crashed/detached page.
+  async teardown() {
+    await this.browser.close();
+  }
+
   saveDebugScreenshot(filename, base64Data) {
     // Screenshots are debug-only. In production (Railway) they cost ~150-300ms
     // each AND write PHI (patient names/DOB/diagnoses) to disk, so they're
@@ -296,6 +350,88 @@ class BillingAgent {
     return fields;
   }
 
+  // Parse a charge that may arrive as a number, "95.97", "$95.97" or "1,234.50".
+  // The sheet's Charge Amount column is currency-formatted, so a stray "$" would
+  // make parseFloat return NaN and silently break the charge comparison.
+  // Returns a Number, or null when there's nothing parseable.
+  parseMoney(v) {
+    if (v === '' || v == null) return null;
+    const n = parseFloat(String(v).replace(/[$,\s]/g, ''));
+    return isNaN(n) ? null : n;
+  }
+
+  // Write the claim's own POS / modifier / charge / units into one billing line
+  // and verify each by read-back.
+  //
+  // Used by BOTH CPT paths. The manual path has always done this. The popup path
+  // did NOT: selecting a row from Office Ally's User CPT list auto-fills that
+  // row's STORED POS/charge/modifier/units, which are not necessarily the ones on
+  // the sheet. That was harmless while every claim was one code at one price; with
+  // seven different charges and a modifier that is sometimes blank it is not, so
+  // the sheet now wins on both paths.
+  //
+  // The sheet carries ONE modifier per line, so only ModifierA is written.
+  // ModifierB/C/D are deliberately never written and never cleared — whatever the
+  // CPT library puts there must survive untouched. Likewise an empty Modifier
+  // column does not wipe a pre-filled ModifierA.
+  async applyLineFields(lineIndex, line, logger, opts = {}) {
+    const page = this.browser.page;
+    const base = 'ctl00_phFolderContent_ucVisitLineItem_ucBillingCPT';
+
+    const setField = async (fieldName, value, label) => {
+      if (value === '' || value == null) return;
+      const id = `${base}_${fieldName}${lineIndex}`;
+      const loc = page.locator(`#${id}`);
+      if (await loc.count() === 0) { logger.log(`⚠️  ${label} field #${id} not found`); return; }
+      await loc.scrollIntoViewIfNeeded();
+      await loc.click({ clickCount: 3 });
+      await loc.fill('');
+      await loc.type(String(value), { delay: 60 });
+      await page.keyboard.press('Tab');   // blur fires the field's change handler
+      await page.waitForTimeout(400);
+    };
+
+    // Field order matches what the manual path has always used. On the popup path
+    // DOS and CPT are already set (DOS by the visit date, CPT by the selection),
+    // so we leave them alone rather than risk re-triggering a change handler.
+    if (opts.writeDos) await setField('DOS', this.convertDate(line.dos), 'DOS');
+    await setField('PlaceOfService', line.pos, 'POS');
+    if (opts.writeCpt) await setField('CPT', line.cpt, 'CPT');
+    await setField('ModifierA', line.modifier, 'Modifier');
+    // Format charge to 2 decimals (75 → "75.00") to match manual entry.
+    const chargeNum = this.parseMoney(line.charge);
+    const chargeFmt = chargeNum != null ? chargeNum.toFixed(2) : line.charge;
+    await setField('Charge', chargeFmt, 'Charge');
+    await setField('Quantity', line.units || '1', 'Units');
+    await page.waitForTimeout(800);
+    await this.shot(page, `after-line-fields${lineIndex}.png`);
+
+    // Verify what actually landed. Charge and units are compared numerically to
+    // tolerate 75 vs 75.00; POS and modifier are compared as strings.
+    const readBack = async (f) => page.locator(`#${base}_${f}${lineIndex}`).inputValue().catch(() => '');
+    const dosV = await readBack('DOS');
+    const posV = await readBack('PlaceOfService');
+    const modV = await readBack('ModifierA');
+    const chgV = await readBack('Charge');
+    const qtyV = await readBack('Quantity');
+    logger.log(`🔎 line ${lineIndex + 1} → DOS="${dosV}" POS="${posV}" mod="${modV}" charge="${chgV}" units="${qtyV}"`);
+
+    if (line.pos && posV !== String(line.pos)) {
+      throw new Error(`POS mismatch line ${lineIndex} (expected ${line.pos}, got "${posV}")`);
+    }
+    if (line.modifier && modV !== String(line.modifier)) {
+      throw new Error(`Modifier mismatch line ${lineIndex} (expected ${line.modifier}, got "${modV}")`);
+    }
+    if (chargeNum != null && this.parseMoney(chgV) !== chargeNum) {
+      throw new Error(`Charge mismatch line ${lineIndex} (expected ${chargeNum.toFixed(2)}, got "${chgV}")`);
+    }
+    const wantUnits = this.parseMoney(line.units || '1');
+    if (wantUnits != null && qtyV !== '' && this.parseMoney(qtyV) !== wantUnits) {
+      throw new Error(`Units mismatch line ${lineIndex} (expected ${wantUnits}, got "${qtyV}")`);
+    }
+    logger.log(`✅ line ${lineIndex + 1} fields verified against the claim`);
+  }
+
   // Fill a single billing line (CPT, pointer) at the given zero-based line index.
   // Tries the CPT popup first; on empty results, would fall back to manual entry
   // (manual path added once the modifier field id is confirmed).
@@ -357,67 +493,87 @@ class BillingAgent {
     const selectCount = await cptPopup.locator('a:has-text("Select")').count();
     logger.log(`🔎 CPT ${cpt}: ${selectCount} result(s) (resultsReady=${resultsReady})`);
 
+    // ---- Popup path: pick the row whose code cell EXACTLY matches the code we
+    // asked for. Clicking the first row blindly is unsafe now that neighbouring
+    // codes coexist in the User CPT list (H0001/H0004/H0005, 99211/99212/99215)
+    // and one search can return several of them.
+    let selectedViaPopup = false;
     if (selectCount > 0) {
-      // ---- Popup path: select first row, auto-fills POS/charge/description ----
-      await Promise.all([
-        cptPopup.waitForEvent('close', { timeout: 10000 }).catch(() => {}),
-        cptPopup.click('a:has-text("Select")', { noWaitAfter: true }).catch(() => {})
-      ]);
-      logger.log(`✅ CPT ${cpt} selected via popup`);
-      await page.waitForTimeout(2500);
-    } else {
+      const cnorm = s => String(s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+      const rows = await cptPopup.evaluate(() => {
+        const out = [];
+        Array.from(document.querySelectorAll('tr')).forEach((tr) => {
+          const sel = Array.from(tr.querySelectorAll('a')).find(a => a.textContent.trim() === 'Select');
+          if (!sel) return;
+          out.push({ cells: Array.from(tr.querySelectorAll('td')).map(td => (td.innerText || '').trim()) });
+        });
+        return out;
+      });
+
+      // A cell counts as the code cell if it IS the code, or if it leads with it
+      // ("H0020 - Alcohol and/or drug services"). Leading-token only, so 99211
+      // can never match a row for 99212.
+      const wantCpt = cnorm(cpt);
+      const isCodeCell = (cell) => {
+        const c = cnorm(cell);
+        return c === wantCpt || c.split(/[\s\-–:,]+/)[0] === wantCpt;
+      };
+
+      let matches = [];
+      rows.forEach((r, idx) => { if (r.cells.some(isCodeCell)) matches.push(idx); });
+
+      // The same code can be listed more than once with different stored
+      // modifiers — let the sheet's modifier break the tie.
+      if (matches.length > 1 && line.modifier) {
+        const byMod = matches.filter(idx => rows[idx].cells.map(cnorm).includes(cnorm(line.modifier)));
+        if (byMod.length === 1) {
+          logger.log(`ℹ️  CPT ${cpt}: ${matches.length} rows, narrowed to 1 by modifier "${line.modifier}"`);
+          matches = byMod;
+        }
+      }
+
+      logger.log(`🔎 CPT ${cpt}: ${matches.length} exact-code row(s) of ${rows.length}`);
+
+      if (matches.length > 1) {
+        // The User CPT list genuinely holds the same code more than once (H0004
+        // does), and with no modifier on the sheet there's nothing to break the
+        // tie. Don't guess a row — but don't fail the claim either: fall through
+        // to manual entry, which types CPT/POS/modifier/charge/units straight
+        // from the sheet and verifies each by read-back. The only thing lost is
+        // the library row's stored description.
+        matches.forEach(i => logger.log(`   ambiguous row ${i}: ${JSON.stringify(rows[i].cells).slice(0, 160)}`));
+        logger.log(`⚠️  CPT ${cpt}: ${matches.length} identical-code rows — not guessing, entering the line manually instead`);
+        matches = [];
+      }
+
+      if (matches.length === 1) {
+        const selectLinks = cptPopup.locator('a:has-text("Select")');
+        await Promise.all([
+          cptPopup.waitForEvent('close', { timeout: 10000 }).catch(() => {}),
+          selectLinks.nth(matches[0]).click({ noWaitAfter: true }).catch(() => {})
+        ]);
+        logger.log(`✅ CPT ${cpt} selected via popup (exact-code row ${matches[0]})`);
+        await page.waitForTimeout(2500);
+        selectedViaPopup = true;
+
+        // Selecting the row auto-filled Office Ally's STORED POS/charge/modifier/
+        // units. Overwrite them with the claim's own values and verify.
+        await this.applyLineFields(lineIndex, line, logger, { writeDos: false, writeCpt: false });
+      } else {
+        // Results came back but none is this exact code — treat it as "not in the
+        // list" and fall through to manual entry rather than billing a neighbour.
+        logger.log(`ℹ️  CPT ${cpt}: ${selectCount} row(s) returned, none an exact code match — entering manually`);
+      }
+    }
+
+    if (!selectedViaPopup) {
       // ---- Manual path: code not in User CPT list. Type the line fields
       // directly from the claim. Field ids confirmed via dumpLineFields:
       // CPT{i}, PlaceOfService{i}, ModifierA{i}, Charge{i}, Quantity{i}, DOS{i}.
-      this.saveDebugScreenshot(`cpt-manual-line${lineIndex}.png`, await cptPopup.screenshot());
+      await this.shot(cptPopup, `cpt-manual-line${lineIndex}.png`);
       await cptPopup.close().catch(() => {});
       logger.log(`📝 CPT ${cpt} not in list — entering line ${lineIndex + 1} manually`);
-
-      const setField = async (fieldName, value, label) => {
-        if (value === '' || value == null) return;
-        const id = `${base}_${fieldName}${lineIndex}`;
-        const loc = page.locator(`#${id}`);
-        if (await loc.count() === 0) { logger.log(`⚠️  ${label} field #${id} not found`); return; }
-        await loc.scrollIntoViewIfNeeded();
-        await loc.click({ clickCount: 3 });
-        await loc.fill('');
-        await loc.type(String(value), { delay: 60 });
-        await page.keyboard.press('Tab');   // blur fires the field's change handler
-        await page.waitForTimeout(400);
-      };
-
-      await setField('DOS', this.convertDate(line.dos), 'DOS');
-      await setField('PlaceOfService', line.pos, 'POS');
-      await setField('CPT', cpt, 'CPT');
-      await setField('ModifierA', line.modifier, 'Modifier');
-      // Format charge to 2 decimals (75 → "75.00") to match manual entry.
-      const chargeFmt = (line.charge !== '' && !isNaN(parseFloat(line.charge)))
-        ? parseFloat(line.charge).toFixed(2)
-        : line.charge;
-      await setField('Charge', chargeFmt, 'Charge');
-      await setField('Quantity', line.units || '1', 'Units');
-      await page.waitForTimeout(800);
-      this.saveDebugScreenshot(`after-manual-line${lineIndex}.png`, await page.screenshot());
-
-      // Verify the manual fields landed (charge compared numerically to tolerate
-      // 75 vs 75.00; POS/modifier compared as strings).
-      const readBack = async (f) => page.locator(`#${base}_${f}${lineIndex}`).inputValue().catch(() => '');
-      const posV = await readBack('PlaceOfService');
-      const modV = await readBack('ModifierA');
-      const chgV = await readBack('Charge');
-      const dosV = await readBack('DOS');
-      logger.log(`🔎 manual line ${lineIndex + 1} → DOS="${dosV}" POS="${posV}" mod="${modV}" charge="${chgV}"`);
-
-      if (line.pos && posV !== String(line.pos)) {
-        throw new Error(`POS mismatch line ${lineIndex} (expected ${line.pos}, got "${posV}")`);
-      }
-      if (line.modifier && modV !== String(line.modifier)) {
-        throw new Error(`Modifier mismatch line ${lineIndex} (expected ${line.modifier}, got "${modV}")`);
-      }
-      if (line.charge && parseFloat(chgV) !== parseFloat(line.charge)) {
-        throw new Error(`Charge mismatch line ${lineIndex} (expected ${line.charge}, got "${chgV}")`);
-      }
-      logger.log(`✅ manual line ${lineIndex + 1} fields verified`);
+      await this.applyLineFields(lineIndex, line, logger, { writeDos: true, writeCpt: true });
     }
 
     // Verify CPT landed in this line's CPT field.
@@ -476,27 +632,21 @@ class BillingAgent {
   }
 
   async login(logger) {
-    logger.log("🌐 Getting initial page screenshot...");
-    const initialPage = await this.browser.takeScreenshot("https://pm.officeally.com/pm/login.aspx");
-    const pageData = initialPage.data;
-    this.saveDebugScreenshot("step1-initial.png", pageData.screenshot);
-    logger.log(`📄 Page: ${pageData.pageInfo.bodyText.slice(0, 100)}`);
-
-    let firewallCaptcha = "";
-    const isFirewall = pageData.pageInfo.bodyText.includes("testing whether you are a human");
-    if (isFirewall) {
-      logger.log("🚧 Firewall CAPTCHA detected — asking AI...");
-      firewallCaptcha = await this.ai.readCaptcha(pageData.screenshot);
-      logger.log(`🤖 Firewall CAPTCHA: "${firewallCaptcha}"`);
-    } else {
-      logger.log("✅ No firewall — going straight to login");
-    }
-
+    // We used to fetch login.aspx here FIRST, purely to look for a firewall
+    // CAPTCHA, and then loginWithCaptcha fetched the very same page again. Since
+    // Office Ally moved to Auth0 that page is a slow redirect chain — the wasted
+    // duplicate load measured 42s of a 209s claim.
+    //
+    // It bought nothing even when a firewall WAS present: the CAPTCHA read from
+    // that first load is a different challenge than the one rendered on the
+    // second load, so the pre-solved text never applied. loginWithCaptcha detects
+    // the firewall on its own and reports stillFirewall, and the retry path below
+    // then takes a FRESH screenshot and solves the CAPTCHA actually on screen.
     logger.log("🔐 Running full login script in single session...");
     const loginResult = await this.browser.loginWithCaptcha(
       process.env.OFFICE_ALLY_USERNAME,
       process.env.OFFICE_ALLY_PASSWORD,
-      firewallCaptcha,
+      "",
       ""
     );
 
@@ -552,7 +702,7 @@ class BillingAgent {
     logger.start();
 
     try {
-      await this.login(logger);
+      await this.ensureLoggedIn(logger);
 
       // ── Step 1: Click Manage Patients tab ─────────────────────────
       logger.log("📋 Navigating to Manage Patients...");
@@ -689,7 +839,11 @@ class BillingAgent {
 
           // Let any navigation/AJAX from the Template click settle before we
           // look for Create New Visit (avoids "execution context destroyed").
-          await page0.waitForLoadState('networkidle', { timeout: 8000 }).catch(() => {});
+          // Capped at 2.5s, not 8s: Practice Mate polls in the background, so
+          // networkidle almost never fires and the full timeout is burned on
+          // EVERY attempt — measured at 16s per claim across two attempts. The
+          // waitForSelector below is the real signal and auto-waits anyway.
+          await page0.waitForLoadState('networkidle', { timeout: 2500 }).catch(() => {});
 
           // Wait for Create New Visit to be genuinely VISIBLE.
           await page0.waitForSelector('a:has-text("Create New Visit")', { state: 'visible', timeout: 12000 });
@@ -760,8 +914,14 @@ class BillingAgent {
       // which token is the surname. Instead we try searching by EACH token
       // until the popup returns rows, then match the row where ALL of the
       // claim's name tokens appear across the row's cells (order-independent).
+      // An NPI alone is enough to identify a provider — don't require a name too.
+      // Omnis has three rendering providers, two of which ("OMNIS HEALTH LIFE, MD"
+      // 1154861557 and "OMNIS HEALTH LIFE, LLC" 1548794886) are near-identical by
+      // name, so if the sheet's Rendering Provider cell is ever blank the old gate
+      // fell through to "click the first row" and silently billed the wrong one.
       const rp = (claimData.rendering_provider || '').trim();
-      if (rp) {
+      const rpNpi = String(claimData.rendering_npi || '').replace(/\D/g, '');
+      if (rp || rpNpi) {
         const norm = s => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
         const tokens = rp.split(/\s+/).map(norm).filter(t => t.length > 1);
 
@@ -810,19 +970,38 @@ class BillingAgent {
         }
 
         // MATCH STRATEGY:
-        //   - If a rendering_npi is present AND match_provider_by_npi is set,
-        //     match by NPI (required when provider rows collide by name, e.g.
-        //     Omnis's two "OMNIS HEALTH LIFE" rows differing only by NPI).
+        //   - If a rendering_npi is present, match by NPI. An NPI that hits
+        //     exactly one row is never the wrong answer, and it is the ONLY
+        //     unique key when rows collide by name (Omnis's two "OMNIS HEALTH
+        //     LIFE" rows differ only by NPI). No longer gated behind the
+        //     match_provider_by_npi flag — the flag stays honoured by callers
+        //     that set it, but its absence must not silently disable the check.
         //   - Otherwise match by name tokens (order-independent), which handles
         //     Samar's "Samar Abrar" / "Ghanni Muhammad" inconsistent ordering.
         let matches = [];
-        if (claimData.match_provider_by_npi && claimData.rendering_npi) {
-          const wantNpi = String(claimData.rendering_npi).replace(/\D/g, '');
+        let matchedBy = 'name';
+        if (rpNpi) {
+          matchedBy = 'npi';
           rows.forEach((r, idx) => {
-            if (r.cells.map(c => String(c).replace(/\D/g, '')).includes(wantNpi)) matches.push(idx);
+            if (r.cells.map(c => String(c).replace(/\D/g, '')).includes(rpNpi)) matches.push(idx);
           });
-          logger.log(`🔎 Provider by NPI "${wantNpi}": ${matches.length} match(es) of ${rows.length} rows`);
+          logger.log(`🔎 Provider by NPI "${rpNpi}": ${matches.length} match(es) of ${rows.length} rows`);
         } else {
+          rows.forEach((r, idx) => {
+            const cellNorms = r.cells.map(norm);
+            const haystack = cellNorms.join(' ');
+            const allPresent = tokens.every(t => cellNorms.includes(t) || haystack.includes(t));
+            if (allPresent) matches.push(idx);
+          });
+          logger.log(`🔎 Provider "${rp}": ${matches.length} match(es) of ${rows.length} rows`);
+        }
+
+        // If the popup doesn't expose an NPI column at all, an NPI match finds
+        // nothing. Fall back to the name match rather than failing the claim —
+        // this keeps behaviour identical for callers whose popup is name-only.
+        if (matchedBy === 'npi' && matches.length === 0 && tokens.length > 0) {
+          logger.log(`⚠️  Provider NPI "${rpNpi}" matched no row — falling back to name match on "${rp}"`);
+          matchedBy = 'name';
           rows.forEach((r, idx) => {
             const cellNorms = r.cells.map(norm);
             const haystack = cellNorms.join(' ');
@@ -835,7 +1014,7 @@ class BillingAgent {
         if (matches.length !== 1) {
           this.saveDebugScreenshot("provider-match-fail.png", await popup.screenshot());
           await popup.close().catch(() => {});
-          throw new Error(`Rendering provider "${rp}": expected 1 match, found ${matches.length} — refusing to guess`);
+          throw new Error(`Rendering provider "${rp || rpNpi}": expected 1 match, found ${matches.length} — refusing to guess`);
         }
 
         const selectLinks = popup.locator('a:has-text("Select")');
@@ -843,7 +1022,7 @@ class BillingAgent {
           popup.waitForEvent('close', { timeout: 10000 }).catch(() => {}),
           selectLinks.nth(matches[0]).click({ noWaitAfter: true }).catch(() => {})
         ]);
-        logger.log(`✅ Rendering provider selected (matched "${rp}")`);
+        logger.log(`✅ Rendering provider selected (matched by ${matchedBy}: "${matchedBy === 'npi' ? rpNpi : rp}")`);
       } else {
         // No provider name on the claim → legacy first-row behavior.
         logger.log("🖱️  No rendering_provider given — clicking first Select...");
@@ -864,6 +1043,30 @@ class BillingAgent {
       // Wait for the Billing Info tab (next step) instead of a flat 3s.
       await this.browser.page.waitForSelector('a:has-text("Billing Info"), [id*="BillingInfo"]', { state: 'visible', timeout: 10000 }).catch(() => {});
       await this.browser.page.waitForTimeout(500);
+
+      // ── Verify the rendering provider actually landed (HCFA box 24J) ──
+      // There was no check here at all. With one provider that was survivable;
+      // with three — two of them near-identical by name — a silent mis-selection
+      // bills the wrong NPI, so confirm what the form now holds.
+      const provIdVal = await this.browser.page
+        .locator('#ctl00_phFolderContent_ProviderID').inputValue().catch(() => '');
+      logger.log(`🔎 rendering ProviderID="${provIdVal}"`);
+      if (rp || rpNpi) {
+        if (!provIdVal || !provIdVal.trim()) {
+          throw new Error("Rendering Provider ID did not populate after selection");
+        }
+        // NO rendering-NPI read-back here. The Visit Info tab has no NPI field on
+        // this account, and probing a locator that doesn't exist costs Playwright's
+        // full 30s default timeout — measured at 30s per claim, ~25 min across a
+        // 49-row batch, and enough on its own to blow n8n's 180s HTTP timeout.
+        //
+        // It isn't needed: the popup row was matched on the NPI itself and
+        // selectFromPopup throws unless exactly one row matches, so a wrong
+        // provider cannot be selected silently. ProviderID being populated is the
+        // confirmation that the selection took.
+        logger.log("✅ Rendering provider verified on the visit");
+      }
+
       await this.shot(this.browser.page, "after-provider.png");
 
       // ── Step 10: Click Billing Info tab ──────────────────────────
@@ -1022,11 +1225,21 @@ class BillingAgent {
 
       // ── Step 15: Facility lookup (HCFA box 32) ───────────────────
       // Search by the claim's facility name and select the EXACT match.
-      logger.log(`🏢 Opening Facility lookup (search: "${claimData.facility_name}")...`);
-      await this.selectFromPopup('ctl00_phFolderContent_Button35', 'Facility', logger, {
+      // Optionally disambiguate by NPI: Omnis's facility name is the SAME string
+      // as its billing provider ("OMNIS HEALTH LIFE, LLC"), so if the account
+      // holds two identically-named facility rows the name match would report
+      // "ambiguous" and nothing would bill. facility_npi is optional — when it's
+      // absent this behaves exactly as before.
+      const facOpts = {
         search: claimData.facility_name,
         matchName: claimData.facility_name,
-      });
+      };
+      if (claimData.facility_npi) {
+        facOpts.matchNpi = claimData.facility_npi;
+        logger.log(`🏢 Facility: matching by NPI ${claimData.facility_npi}`);
+      }
+      logger.log(`🏢 Opening Facility lookup (search: "${claimData.facility_name}")...`);
+      await this.selectFromPopup('ctl00_phFolderContent_Button35', 'Facility', logger, facOpts);
       await this.shot(page, "after-facility.png");
 
       // ── Step 16: Billing Provider lookup (HCFA box 33) ───────────
@@ -1038,8 +1251,10 @@ class BillingAgent {
       //   - Otherwise → match by name (e.g. Samar, whose "Billing Npi" column is
       //     actually a Tax ID and whose name is the reliable key).
       const billOpts = { search: claimData.billing_provider || '' };
+      let billingMatchedByNpi = false;
       if (claimData.match_billing_by_npi && claimData.billing_npi) {
         billOpts.matchNpi = claimData.billing_npi;
+        billingMatchedByNpi = true;
         logger.log(`🏥 Billing Provider: matching by NPI ${claimData.billing_npi}`);
       } else if (claimData.billing_provider) {
         billOpts.matchName = claimData.billing_provider;
@@ -1063,20 +1278,46 @@ class BillingAgent {
       if (!billingProvVal || !billingProvVal.trim()) {
         throw new Error("Billing Provider ID did not populate after selection");
       }
-      // NOTE: We do NOT compare the sheet's "Billing Npi" to the field, because
-      // for this biller that column holds the Tax ID, not the NPI — they will
-      // never be equal. The selection itself is verified by exact name-match in
-      // selectFromPopup (which throws on no-match/ambiguous), so a wrong billing
-      // provider can't be selected silently. We only confirm the NPI field is
-      // populated (a blank NPI gets the claim rejected at HCFA box 33a).
+      // A blank NPI gets the claim rejected at HCFA box 33a, so it's always a
+      // hard check.
       if (!billingNpiVal || !billingNpiVal.trim()) {
         throw new Error("Billing Provider NPI field is empty after selection");
       }
-      logger.log("✅ Facility + Billing Provider selected and verified (by name match)");
+
+      // When the row was matched BY NPI, the claim's billing_npi is a real NPI and
+      // the form must now hold exactly that — Omnis bills under two NPIs
+      // (1154861557 and 1548794886) behind one identical name, so this is the only
+      // thing that catches picking the wrong one.
+      //
+      // When the row was matched by NAME we do NOT compare, because for some
+      // billers the sheet's "Billing Npi" column actually holds a Tax ID and the
+      // two will never be equal. There, the exact name-match inside
+      // selectFromPopup (which throws on no-match/ambiguous) is the guarantee.
+      if (billingMatchedByNpi) {
+        const wantBillNpi = String(claimData.billing_npi).replace(/\D/g, '');
+        const gotBillNpi = billingNpiVal.replace(/\D/g, '');
+        if (gotBillNpi !== wantBillNpi) {
+          throw new Error(`Billing Provider NPI mismatch: expected ${wantBillNpi}, form has ${gotBillNpi}`);
+        }
+        logger.log(`✅ Facility + Billing Provider verified (NPI ${wantBillNpi} confirmed on the form)`);
+      } else {
+        logger.log("✅ Facility + Billing Provider selected and verified (by name match)");
+      }
 
       // ── Step 17: Click Update to create the visit ────────────────
       // Irreversible save. Every prior step verified (throws on failure), so
       // by here the form is confirmed filled.
+      //
+      // SUBMIT_CLAIM=false stops here: everything is filled and verified but the
+      // visit is NOT saved. That makes it possible to exercise the whole flow
+      // against live Office Ally — new providers, new charges — without creating
+      // real claims. Unset (the default) keeps the normal save.
+      if (process.env.SUBMIT_CLAIM === 'false') {
+        await this.shot(page, "before-update.png");
+        logger.log("🛑 SUBMIT_CLAIM=false — form filled and verified, NOT clicking Update");
+          return logger.getResult("success", "Filled and verified — stopped before Update (SUBMIT_CLAIM=false)");
+      }
+
       logger.log("💾 Clicking Update to create the visit...");
       await this.shot(page, "before-update.png");
 
@@ -1101,9 +1342,11 @@ class BillingAgent {
     } catch (error) {
       logger.log(`💥 Unexpected error: ${error.message}`);
       return logger.getResult("failed", error.message);
-    } finally {
-      await this.browser.close();
     }
+    // NOTE: the browser is intentionally NOT closed here — it stays warm for the
+    // next claim (ensureLoggedIn resets it to a clean home each time, which also
+    // recovers from a claim that died mid-form). The idle timer in index.js
+    // closes it after a stretch of no claims.
   }
 
   _sleep(ms) {

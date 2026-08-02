@@ -1,7 +1,19 @@
 // src/browser-client.js
 const { chromium } = require('playwright-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
+const fs = require('fs');
+const path = require('path');
 chromium.use(StealthPlugin());
+
+// Where the logged-in Office Ally session (cookies + localStorage) is cached.
+//
+// SECURITY: this file holds LIVE session cookies — whoever has it can act as
+// this Office Ally account until they expire. It is gitignored and written
+// 0600. Treat it like a password: don't copy it between machines, don't commit
+// it, and delete it if it may have leaked. Set SESSION_STATE_PATH to relocate
+// it (e.g. onto a Railway volume so it survives redeploys).
+const SESSION_STATE_PATH =
+  process.env.SESSION_STATE_PATH || path.join(__dirname, '..', '.oa-session.json');
 
 // One consistent identity used for EVERY page and popup. The bug before was
 // that the main page got a User-Agent header but popups (window.open) did not,
@@ -35,10 +47,25 @@ class BrowserClient {
       ]
     });
 
+    // Reuse a previously saved logged-in session when one is on disk. This is
+    // what makes a COLD start cheap: instead of ~44s of Auth0 redirects, the
+    // caller navigates to /pm and is already authenticated. A stale file costs
+    // nothing — ensureLoggedIn detects the redirect to login and falls back.
+    let storageState;
+    try {
+      if (fs.existsSync(SESSION_STATE_PATH)) {
+        storageState = JSON.parse(fs.readFileSync(SESSION_STATE_PATH, 'utf8'));
+        console.log('🍪 Loaded saved Office Ally session');
+      }
+    } catch (e) {
+      console.log(`⚠️  Saved session unreadable (${e.message.slice(0, 50)}) — ignoring`);
+    }
+
     // Create ONE context with a real, consistent fingerprint. Every page and
     // every popup opened from this context inherits userAgent, viewport,
     // locale, and timezone — so popups no longer look like headless bots.
     this.context = await this.browser.newContext({
+      ...(storageState ? { storageState } : {}),
       userAgent: USER_AGENT,
       viewport: { width: 1440, height: 900 },
       locale: 'en-US',
@@ -56,6 +83,62 @@ class BrowserClient {
 
     this.page = await this.context.newPage();
     console.log("✅ Chromium launched (context-level fingerprint applied)");
+  }
+
+  // Is there a cached session worth trying before paying for a full login?
+  hasSavedSession() {
+    try { return fs.existsSync(SESSION_STATE_PATH); } catch (e) { return false; }
+  }
+
+  // Persist the logged-in session so the next cold start can skip Auth0.
+  // Written 0600 — see the SECURITY note on SESSION_STATE_PATH above.
+  async saveSession() {
+    if (!this.context) return;
+    try {
+      // Create the parent directory if it's missing. When SESSION_STATE_PATH
+      // points at a Railway volume (e.g. /data/oa-session.json) the mount exists
+      // but may be empty on first boot, and a nested path wouldn't otherwise be
+      // writable.
+      fs.mkdirSync(path.dirname(SESSION_STATE_PATH), { recursive: true });
+      const state = await this.context.storageState();
+      fs.writeFileSync(SESSION_STATE_PATH, JSON.stringify(state), { mode: 0o600 });
+      console.log(`🍪 Saved Office Ally session → ${SESSION_STATE_PATH}`);
+    } catch (e) {
+      // Never fatal: a claim that billed correctly must not fail because the
+      // session cache couldn't be written (unmounted volume, read-only FS).
+      console.log(`⚠️  Could not save session to ${SESSION_STATE_PATH}: ${(e.message || '').slice(0, 80)}`);
+    }
+  }
+
+  // Drop a cached session that no longer authenticates, so the next cold start
+  // doesn't waste a navigation proving it's dead.
+  clearSession() {
+    try { fs.unlinkSync(SESSION_STATE_PATH); } catch (e) { /* nothing to clear */ }
+  }
+
+  // Read the page's visible text safely.
+  //
+  // Office Ally now authenticates through Auth0, so a login submit becomes a
+  // redirect CHAIN. Mid-chain the document can legitimately have no <body> yet,
+  // and a bare `document.body.innerText` throws "Cannot read properties of null
+  // (reading 'innerText')" — which killed the whole claim before it reached the
+  // billing flow. Wait briefly for a body, then read defensively.
+  async readBodyText(timeout = 10000) {
+    await this.page.waitForSelector('body', { timeout }).catch(() => {});
+    return await this.page
+      .evaluate(() => (document.body ? document.body.innerText : ''))
+      .catch(() => '');
+  }
+
+  // A screenshot only ever used for debugging. Capturing costs 150-300ms and
+  // encodes the whole viewport to base64, so skip it entirely unless
+  // DEBUG_SCREENSHOTS is on. Returns null when disabled — every consumer already
+  // guards with `if (screenshot)` before saving.
+  //
+  // NOT for CAPTCHA captures: those feed the vision model and must always run.
+  async debugShot() {
+    if (process.env.DEBUG_SCREENSHOTS !== 'true') return null;
+    return await this.page.screenshot({ encoding: 'base64' }).catch(() => null);
   }
 
   async close() {
@@ -79,7 +162,7 @@ class BrowserClient {
       const inputs = Array.from(document.querySelectorAll('input')).map(el => ({
         type: el.type, name: el.name, id: el.id, placeholder: el.placeholder
       }));
-      const bodyText = document.body.innerText.slice(0, 500);
+      const bodyText = document.body ? document.body.innerText.slice(0, 500) : '';
       return { inputs, bodyText };
     });
     return { data: { screenshot, url: currentUrl, title, pageInfo } };
@@ -91,7 +174,14 @@ class BrowserClient {
       waitUntil: 'domcontentloaded',
       timeout: 60000
     });
-    await this.page.waitForTimeout(3000);
+    // Wait for the login form to actually exist rather than a flat 3s. login.aspx
+    // redirects into Auth0, so the useful signal is "a field rendered", which is
+    // usually well under a second after domcontentloaded — and is also correct on
+    // the slow days a flat 3s would have missed.
+    await this.page.waitForSelector(
+      'input[name="username"], input[name="txtUserName"], input[type="password"], input[type="text"]',
+      { timeout: 20000 }
+    ).catch(() => {});
     const url = this.page.url();
     console.log(`📍 URL: ${url}`);
   }
@@ -133,10 +223,12 @@ class BrowserClient {
     const sleep = ms => this.page.waitForTimeout(ms);
 
     await this.navigateToPracticeMateLogi();
-    await sleep(2000);
+    // navigateToPracticeMateLogi already waited for a form field, so this is just
+    // a short settle rather than the old flat 2s.
+    await sleep(300);
 
-    let bodyText = await this.page.evaluate(() => document.body.innerText);
-    const screenshot1 = await this.page.screenshot({ encoding: 'base64' });
+    let bodyText = await this.readBodyText();
+    const screenshot1 = await this.debugShot();
 
     if (bodyText.includes('testing whether you are a human')) {
       console.log('🚧 Firewall CAPTCHA — solving...');
@@ -151,15 +243,15 @@ class BrowserClient {
         await this.page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 60000 });
       } catch(e) {}
       await sleep(2000);
-      bodyText = await this.page.evaluate(() => document.body.innerText);
+      bodyText = await this.readBodyText();
       console.log('After firewall URL:', this.page.url());
 
       await this.navigateToPracticeMateLogi();
       await sleep(2000);
-      bodyText = await this.page.evaluate(() => document.body.innerText);
+      bodyText = await this.readBodyText();
     }
 
-    const screenshot2 = await this.page.screenshot({ encoding: 'base64' });
+    const screenshot2 = await this.debugShot();
     const inputs = await this.page.evaluate(() =>
       Array.from(document.querySelectorAll('input')).map(el => ({
         type: el.type, name: el.name, id: el.id, placeholder: el.placeholder
@@ -193,13 +285,13 @@ class BrowserClient {
     }
     if (userField) {
       await userField.click({ clickCount: 3 });
-      await userField.type(username, { delay: 60 });
+      await userField.type(username, { delay: 15 });
     }
 
     const passField = await this.page.$('input[type="password"]');
     if (passField) {
       await passField.click({ clickCount: 3 });
-      await passField.type(password, { delay: 60 });
+      await passField.type(password, { delay: 15 });
     }
 
     if (bodyText.includes('code is in the image') || bodyText.includes('What code')) {
@@ -243,7 +335,7 @@ class BrowserClient {
     await this.page.waitForLoadState('domcontentloaded').catch(() => {});
     await sleep(2500);
 
-    let postLoginBody = await this.page.evaluate(() => document.body.innerText);
+    let postLoginBody = await this.readBodyText();
     if (postLoginBody.includes('testing whether you are a human')) {
       console.log('🚧 Post-login CAPTCHA detected — returning for AI to solve...');
       const captchaScreenshot = await this.page.screenshot({ encoding: 'base64' });
@@ -264,11 +356,15 @@ class BrowserClient {
       waitUntil: 'domcontentloaded',
       timeout: 60000
     });
-    await sleep(3000);
+    // goto already awaited domcontentloaded; wait for the dashboard's own nav to
+    // render instead of a flat 3s, since that's the thing the next step clicks.
+    await this.page.waitForSelector('a:has-text("Manage Patients"), td:has-text("Manage Patients")',
+      { timeout: 15000 }).catch(() => {});
+    await sleep(500);
 
     const finalUrl = this.page.url();
     const finalTitle = await this.page.title();
-    const finalScreenshot = await this.page.screenshot({ encoding: 'base64' });
+    const finalScreenshot = await this.debugShot();
     const success = !finalUrl.includes('login') && !finalUrl.includes('Login') && !finalUrl.includes('auth.');
 
     console.log(`📍 Final URL: ${finalUrl}`);

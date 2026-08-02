@@ -23,6 +23,43 @@ function runExclusive(task) {
   return result;
 }
 
+// ── Warm, reused billing agent ───────────────────────────────────
+// One logged-in Office Ally session kept alive across claims. The first claim
+// (or one after the session expires) pays the ~50s Auth0 login; the rest reuse
+// it, cutting ~50s off each. An idle timer closes the browser after a stretch of
+// no claims, to free memory and drop a stale session.
+//
+// Safe because runExclusive above already guarantees one claim at a time, and
+// the agent re-navigates to a known home page before every claim. No n8n change:
+// the HTTP contract is untouched.
+let warmAgent = null;
+let idleTimer = null;
+const SESSION_IDLE_MS = parseInt(process.env.SESSION_IDLE_MS || String(5 * 60 * 1000));
+
+function getAgent() {
+  if (!warmAgent) warmAgent = new BillingAgent();
+  return warmAgent;
+}
+
+function cancelIdleTeardown() {
+  if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
+}
+
+function scheduleIdleTeardown() {
+  cancelIdleTeardown();
+  idleTimer = setTimeout(() => {
+    idleTimer = null;
+    // Serialize through the same queue so teardown can't race a running claim.
+    runExclusive(async () => {
+      if (warmAgent) {
+        console.log("💤 Idle timeout — closing warm Office Ally session");
+        await warmAgent.teardown().catch(() => {});
+      }
+    });
+  }, SESSION_IDLE_MS);
+  if (idleTimer.unref) idleTimer.unref(); // don't keep the process alive just for this
+}
+
 // ── Validate a claim payload before opening a browser ────────────
 function validateClaim(c) {
   const errors = [];
@@ -71,9 +108,10 @@ app.post("/process-claim", async (req, res) => {
 
   try {
     const result = await runExclusive(async () => {
-      const agent = new BillingAgent(); // fresh agent (and browser) per claim
-      return await agent.processClaim(claimData);
+      cancelIdleTeardown(); // a claim is running — don't tear the session down mid-flight
+      return await getAgent().processClaim(claimData); // warm, reused session
     });
+    scheduleIdleTeardown();
     const statusCode = result.status === "success" ? 200 : 422;
     return res.status(statusCode).json(result);
   } catch (error) {
@@ -86,9 +124,23 @@ app.post("/process-claim", async (req, res) => {
   }
 });
 
+// The warm agent's browser outlives a single request by design, so close it on
+// shutdown — Railway sends SIGTERM on redeploy — and Chromium doesn't leak.
+["SIGTERM", "SIGINT"].forEach((sig) => {
+  process.on(sig, async () => {
+    console.log(`\n${sig} — closing warm Office Ally session...`);
+    cancelIdleTeardown();
+    if (warmAgent) await warmAgent.teardown().catch(() => {});
+    process.exit(0);
+  });
+});
+
 app.listen(PORT, () => {
   console.log(`\n🚀 Billing Agent running on port ${PORT}`);
   console.log(`🤖 AI Provider: ${process.env.AI_PROVIDER || "gemini"}`);
+  // Print where the login session is cached so it's obvious from the deploy logs
+  // whether a mounted volume actually took effect.
+  console.log(`🍪 Session cache: ${process.env.SESSION_STATE_PATH || "<repo>/.oa-session.json (ephemeral)"}`);
   if (!API_KEY) console.log("⚠️  AGENT_API_KEY not set — endpoint is unauthenticated");
   console.log(`\nEndpoints:`);
   console.log(`  GET  /health`);

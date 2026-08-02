@@ -1,6 +1,9 @@
 # secrets
 .env
 
+# cached Office Ally session — holds LIVE session cookies, treat as a credential
+.oa-session.json
+
 # dependencies
 node_modules/
 
