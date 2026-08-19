@@ -642,13 +642,20 @@ class BillingAgent {
     // second load, so the pre-solved text never applied. loginWithCaptcha detects
     // the firewall on its own and reports stillFirewall, and the retry path below
     // then takes a FRESH screenshot and solves the CAPTCHA actually on screen.
+    // .trim() the credentials. A Railway variable pasted with a leading space
+    // already broke SESSION_STATE_PATH silently; the same paste mistake in a
+    // password produces "Wrong username or password" with nothing to see.
+    const oaUser = (process.env.OFFICE_ALLY_USERNAME || "").trim();
+    const oaPass = (process.env.OFFICE_ALLY_PASSWORD || "").trim();
+    if (!oaUser || !oaPass) {
+      throw new Error("OFFICE_ALLY_USERNAME / OFFICE_ALLY_PASSWORD are not set");
+    }
+    // Shape only — never the values. Makes a stray space or a truncated paste
+    // obvious from the deploy log without exposing the credential.
+    logger.log(`🔐 Credentials: user ${oaUser.length} chars, pass ${oaPass.length} chars`);
+
     logger.log("🔐 Running full login script in single session...");
-    const loginResult = await this.browser.loginWithCaptcha(
-      process.env.OFFICE_ALLY_USERNAME,
-      process.env.OFFICE_ALLY_PASSWORD,
-      "",
-      ""
-    );
+    const loginResult = await this.browser.loginWithCaptcha(oaUser, oaPass, "", "");
 
     const loginData = loginResult.data;
     this.saveDebugScreenshot("step2-login-result.png", loginData.screenshot);
@@ -687,6 +694,12 @@ class BillingAgent {
       }
       logger.log("✅ Logged in on retry!");
       return retryResult.data.screenshot;
+    }
+
+    // Auth0 told us exactly why. Say so, rather than printing a redirect URL and
+    // leaving whoever reads the log to guess.
+    if (loginData.loginError) {
+      throw new Error(`Office Ally rejected the login: "${loginData.loginError}"`);
     }
 
     if (!loginData.success) {

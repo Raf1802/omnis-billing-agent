@@ -12,8 +12,19 @@ chromium.use(StealthPlugin());
 // 0600. Treat it like a password: don't copy it between machines, don't commit
 // it, and delete it if it may have leaked. Set SESSION_STATE_PATH to relocate
 // it (e.g. onto a Railway volume so it survives redeploys).
+// .trim() is not paranoia: a Railway variable was once pasted as
+// " /data/oa-session.json" (leading space), which silently made this a RELATIVE
+// path — so the session cache wrote next to the app instead of onto the mounted
+// volume, and nothing looked wrong. Trim every env value we build paths or
+// credentials from.
 const SESSION_STATE_PATH =
-  process.env.SESSION_STATE_PATH || path.join(__dirname, '..', '.oa-session.json');
+  (process.env.SESSION_STATE_PATH || "").trim() ||
+  path.join(__dirname, "..", ".oa-session.json");
+
+// What Auth0 says when it refuses a login. Matched against the rendered page so
+// the real reason reaches the logs instead of an opaque redirect URL.
+const LOGIN_ERROR_RE =
+  /wrong username or password|account has been blocked|too many failed|password has expired|user is blocked/i;
 
 // One consistent identity used for EVERY page and popup. The bug before was
 // that the main page got a User-Agent header but popups (window.open) did not,
@@ -327,12 +338,47 @@ class BrowserClient {
     }
     if (loginBtn) await loginBtn.click();
 
-    try {
-      await this.page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 60000 });
-    } catch(e) {}
-    // Navigation is already awaited above; a short settle is enough for the
-    // post-login page / CAPTCHA-check to render (was a flat 8s).
-    await this.page.waitForLoadState('domcontentloaded').catch(() => {});
+    // Auth0 renders the login form client-side, so a REJECTED credential updates
+    // the page with an inline error and never navigates. A flat waitForNavigation
+    // therefore burned its full 60s on every failed claim and then reported only
+    // a URL — which is why a simple wrong password looked like a mystery.
+    //
+    // Race the navigation against the error text: a bad password now fails in a
+    // few seconds WITH the reason Auth0 actually gave.
+    let loginError = "";
+    const navDone = this.page
+      .waitForNavigation({ waitUntil: "domcontentloaded", timeout: 60000 })
+      .then(() => "navigated")
+      .catch(() => "no-navigation");
+    const errSeen = (async () => {
+      for (let i = 0; i < 15; i++) {
+        await this.page.waitForTimeout(1000);
+        const t = await this.readBodyText(2000);
+        const hit = t
+          .split("\n")
+          .map((s) => s.trim())
+          .find((s) => LOGIN_ERROR_RE.test(s));
+        if (hit) { loginError = hit; return "auth-error"; }
+      }
+      return "no-error";
+    })();
+    await Promise.race([navDone, errSeen]);
+
+    if (loginError) {
+      console.log(`❌ Office Ally rejected the login: "${loginError}"`);
+      return {
+        data: {
+          screenshot: await this.debugShot(),
+          screenshot1, screenshot2,
+          url: this.page.url(),
+          stillFirewall: false,
+          success: false,
+          loginError,
+        },
+      };
+    }
+
+    await this.page.waitForLoadState("domcontentloaded").catch(() => {});
     await sleep(2500);
 
     let postLoginBody = await this.readBodyText();
